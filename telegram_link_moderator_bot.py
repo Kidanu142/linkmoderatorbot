@@ -1,109 +1,104 @@
 import os
-import re
-import asyncio
-from datetime import datetime, timedelta
-from telegram import Update, ChatPermissions
-from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
+import logging
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 
-# ----------------- LOAD ENV -----------------
+# Load environment variables
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = set(map(int, os.getenv("ADMIN_IDS", "").split(",")))
 
-# ----------------- CONFIG -----------------
-WARN_LIMIT = 3
-MUTE_SECONDS = 10 * 60  # 10 minutes
-user_warns = {}  # {(chat_id, user_id): warn_count}
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Regex to detect links
-LINK_RE = re.compile(r"(?:(?:https?://)|(?:www\.)|(?:t\.me/)|(?:telegram\.me/)|(?:\S+@\S+\.\S+))", re.IGNORECASE)
+# Get environment variables
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+PORT = int(os.environ.get('PORT', 8443))
 
-# ----------------- HELPERS -----------------
-def is_link(text: str) -> bool:
-    if not text:
-        return False
-    return bool(LINK_RE.search(text))
-
-async def warn_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, username: str, warn_count: int):
-    remaining = WARN_LIMIT - warn_count
-    if remaining > 0:
-        text = (
-            f"@{username or user_id}, STEM Warning {warn_count}/{WARN_LIMIT}. "
-            f"You have {remaining} warning(s) left. Do not post external links."
-        )
-    else:
-        text = (
-            f"@{username or user_id}, STEM Warning {warn_count}/{WARN_LIMIT}. "
-            "You have reached the maximum warnings. You will be muted for 10 minutes."
-        )
-    await context.bot.send_message(chat_id=chat_id, text=text)
-
-async def restrict_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, duration_seconds: int):
-    permissions = ChatPermissions(can_send_messages=False)
-    until_date = datetime.utcnow() + timedelta(seconds=duration_seconds)
-    await context.bot.restrict_chat_member(chat_id=chat_id, user_id=user_id, permissions=permissions, until_date=until_date)
-    await context.bot.send_message(chat_id=chat_id, text=f"User [{user_id}] has been muted for 10 minutes by STEM rules.")
-
-async def ban_user(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
-    await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
-    await context.bot.send_message(chat_id=chat_id, text=f"User [{user_id}] has been banned by STEM for repeated link violations.")
-
-# ----------------- HANDLER -----------------
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.effective_message
-    if not message or not message.text:
-        return
-
-    chat = update.effective_chat
+# Command handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a message when the command /start is issued."""
     user = update.effective_user
-    if not chat or not user:
-        return
+    await update.message.reply_html(
+        f"Hi {user.mention_html()}! 👋\n\n"
+        "I'm a simple Telegram bot deployed on Render!\n"
+        "Use /help to see available commands."
+    )
 
-    # Only for groups
-    if chat.type not in ("group", "supergroup"):
-        return
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a message when the command /help is issued."""
+    help_text = """
+🤖 Available Commands:
 
-    # Exempt admins
-    if user.id in ADMIN_IDS:
-        return
+/start - Start the bot
+/help - Show this help message
+/echo [text] - Echo your text
+/about - About this bot
 
-    text = message.text_html or message.text
-    if not is_link(text):
-        return
+You can also just send me any message and I'll repeat it!
+    """
+    await update.message.reply_text(help_text)
 
-    key = (chat.id, user.id)
-    warn_count = user_warns.get(key, 0) + 1
-    user_warns[key] = warn_count
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Echo the user message."""
+    text = update.message.text
+    if text.startswith('/echo'):
+        # Remove the command part if used with /echo
+        text = ' '.join(text.split()[1:]) or "You didn't provide any text!"
+    
+    await update.message.reply_text(f"🔁 You said: {text}")
 
-    if warn_count < WARN_LIMIT:
-        await warn_user(context, chat.id, user.id, user.username or str(user.id), warn_count)
-    elif warn_count == WARN_LIMIT:
-        await warn_user(context, chat.id, user.id, user.username or str(user.id), warn_count)
-        await restrict_user(context, chat.id, user.id, MUTE_SECONDS)
+async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show information about the bot."""
+    about_text = """
+🤖 Simple Telegram Bot
 
-        # Schedule post-mute check
-        async def post_mute_check():
-            await asyncio.sleep(MUTE_SECONDS + 1)
-            # If user posts another link -> ban
-            current_warn = user_warns.get(key, 0)
-            if current_warn > WARN_LIMIT:
-                await ban_user(context, chat.id, user.id)
-                user_warns.pop(key, None)
-            else:
-                user_warns.pop(key, None)
+This is a basic Telegram bot deployed on Render using:
+- Python-telegram-bot
+- Environment variables
+- Webhook setup
 
-        context.application.create_task(post_mute_check())
-    else:
-        await ban_user(context, chat.id, user.id)
-        user_warns.pop(key, None)
+Built with ❤️ for deployment on Render!
+    """
+    await update.message.reply_text(about_text)
 
-# ----------------- START BOT -----------------
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Log errors caused by updates."""
+    logger.error(f"Exception while handling an update: {context.error}")
+
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    print("STEM Link Moderator Bot running...")
-    app.run_polling()
+    """Start the bot."""
+    if not BOT_TOKEN:
+        logger.error("BOT_TOKEN environment variable is not set!")
+        return
 
-if __name__ == "__main__":
+    # Create Application
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("echo", echo))
+    application.add_handler(CommandHandler("about", about))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    
+    # Add error handler
+    application.add_error_handler(error_handler)
+
+    # Start the Bot
+    if os.getenv('RENDER'):  # Running on Render
+        webhook_url = f"https://{os.getenv('RENDER_SERVICE_NAME')}.onrender.com/{BOT_TOKEN}"
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=BOT_TOKEN,
+            webhook_url=webhook_url
+        )
+    else:  # Running locally
+        application.run_polling()
+
+if __name__ == '__main__':
     main()
